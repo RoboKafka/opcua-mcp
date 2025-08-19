@@ -69,7 +69,7 @@ I have added the path to the python evnironment
 {
   "mcpServers": {
     "opcua-mcp": {
-      "command": "C:\\Users\\Owner\\anaconda3\\envs\\mcpopcua\python.exe",
+      "command": "C:\\Users\\Owner\\anaconda3\\envs\\mcpopcua\\python.exe",
       "args": ["path to main.py"],
       "env": {
         "OPCUA_SERVER_URL": "opcua url",
