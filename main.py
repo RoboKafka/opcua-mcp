@@ -8,7 +8,7 @@ import sys
 from typing import List, Dict, Any
 from opcua import ua
 
-server_url = os.getenv("OPCUA_SERVER_URL", "opc.tcp://192.168.0.100:5005")
+server_url = os.getenv("OPCUA_SERVER_URL", "<yourdefaultserverurl>")
 username = os.getenv("OPCUA_USERNAME")
 password = os.getenv("OPCUA_PASSWORD")
 
