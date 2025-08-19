@@ -4,32 +4,142 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 import asyncio
 import os
+import sys
 from typing import List, Dict, Any
-from opcua import ua # 
+from opcua import ua
 
-server_url = os.getenv("OPCUA_SERVER_URL", "opc.tcp://localhost:4840")
+server_url = os.getenv("OPCUA_SERVER_URL", "opc.tcp://192.168.0.100:5005")
+username = os.getenv("OPCUA_USERNAME")
+password = os.getenv("OPCUA_PASSWORD")
 
-# Manage the lifecycle of the OPC UA client connection
+# Global client variable for lazy connection
+_opcua_client = None
+
+async def get_opcua_client():
+    """Get or create OPC UA client connection."""
+    global _opcua_client
+    
+    if _opcua_client is None:
+        _opcua_client = Client(server_url)
+        
+        # Set security policy to None for basic connections
+       # _opcua_client.set_security_string("None")
+        
+        # Set authentication if username and password are provided
+        if username and password:
+            _opcua_client.set_user(username)
+            _opcua_client.set_password(password)
+        
+        # Connect
+        await asyncio.to_thread(_opcua_client.connect)
+        print(f"Connected to OPC UA server at {server_url}", file=sys.stderr)
+    
+    return _opcua_client
+
+async def cleanup_client():
+    """Cleanup the global client connection."""
+    global _opcua_client
+    if _opcua_client:
+        try:
+            await asyncio.to_thread(_opcua_client.disconnect)
+            print("Disconnected from OPC UA server", file=sys.stderr)
+        except Exception as e:
+            print(f"Error during disconnect: {e}", file=sys.stderr)
+        finally:
+            _opcua_client = None
+
+def detect_and_convert_value(node, value: str) -> ua.Variant:
+    """
+    Detect the correct data type for a node and convert the value accordingly.
+    This is the key enhancement to fix type mismatch issues.
+    """
+    try:
+        # Get the current data value to determine the expected type
+        current_data_value = node.get_data_value()
+        current_variant_type = current_data_value.Value.VariantType
+        
+        print(f"Node expects variant type: {current_variant_type}", file=sys.stderr)
+        
+        # Convert based on the detected type
+        if current_variant_type == ua.VariantType.Int16:
+            return ua.Variant(int(value), ua.VariantType.Int16)
+        elif current_variant_type == ua.VariantType.Int32:
+            return ua.Variant(int(value), ua.VariantType.Int32)
+        elif current_variant_type == ua.VariantType.UInt16:
+            return ua.Variant(int(value), ua.VariantType.UInt16)
+        elif current_variant_type == ua.VariantType.UInt32:
+            return ua.Variant(int(value), ua.VariantType.UInt32)
+        elif current_variant_type == ua.VariantType.Byte:
+            return ua.Variant(int(value), ua.VariantType.Byte)
+        elif current_variant_type == ua.VariantType.SByte:
+            return ua.Variant(int(value), ua.VariantType.SByte)
+        elif current_variant_type == ua.VariantType.Int64:
+            return ua.Variant(int(value), ua.VariantType.Int64)
+        elif current_variant_type == ua.VariantType.UInt64:
+            return ua.Variant(int(value), ua.VariantType.UInt64)
+        elif current_variant_type == ua.VariantType.Float:
+            return ua.Variant(float(value), ua.VariantType.Float)
+        elif current_variant_type == ua.VariantType.Double:
+            return ua.Variant(float(value), ua.VariantType.Double)
+        elif current_variant_type == ua.VariantType.Boolean:
+            bool_value = value.lower() in ('true', '1', 'on', 'yes')
+            return ua.Variant(bool_value, ua.VariantType.Boolean)
+        elif current_variant_type == ua.VariantType.String:
+            return ua.Variant(str(value), ua.VariantType.String)
+        else:
+            # Fallback: try to auto-detect from the value
+            print(f"Unknown variant type {current_variant_type}, attempting auto-detection", file=sys.stderr)
+            return auto_detect_variant(value)
+            
+    except Exception as e:
+        print(f"Could not detect type from node, using auto-detection: {e}", file=sys.stderr)
+        return auto_detect_variant(value)
+
+def auto_detect_variant(value: str) -> ua.Variant:
+    """Auto-detect the appropriate variant type from the string value."""
+    # Try boolean first
+    if value.lower() in ('true', 'false', 'on', 'off', 'yes', 'no'):
+        bool_value = value.lower() in ('true', 'on', 'yes', '1')
+        return ua.Variant(bool_value, ua.VariantType.Boolean)
+    
+    # Try integer
+    try:
+        int_value = int(value)
+        # Choose appropriate integer type based on range
+        if -32768 <= int_value <= 32767:
+            return ua.Variant(int_value, ua.VariantType.Int16)
+        elif -2147483648 <= int_value <= 2147483647:
+            return ua.Variant(int_value, ua.VariantType.Int32)
+        else:
+            return ua.Variant(int_value, ua.VariantType.Int64)
+    except ValueError:
+        pass
+    
+    # Try float
+    try:
+        float_value = float(value)
+        return ua.Variant(float_value, ua.VariantType.Float)
+    except ValueError:
+        pass
+    
+    # Default to string
+    return ua.Variant(str(value), ua.VariantType.String)
+
+# Simple lifespan that doesn't connect immediately
 @asynccontextmanager
 async def opcua_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     """Handle OPC UA client connection lifecycle."""
-    client = Client(server_url)  
     try:
-        # Connect to OPC UA server synchronously, wrapped in a thread for async compatibility
-        await asyncio.to_thread(client.connect)
-        print("Connected to OPC UA server")
-        yield {"opcua_client": client}
+        yield {}  # Don't connect at startup
     finally:
-        # Disconnect from OPC UA server on shutdown
-        await asyncio.to_thread(client.disconnect)
-        print("Disconnected from OPC UA server")
+        await cleanup_client()
 
 # Create an MCP server instance
 mcp = FastMCP("OPCUA-Control", lifespan=opcua_lifespan)
 
 # Tool: Read the value of an OPC UA node
 @mcp.tool()
-def read_opcua_node(node_id: str, ctx: Context) -> str:
+async def read_opcua_node(node_id: str, ctx: Context) -> str:
     """
     Read the value of a specific OPC UA node.
     
@@ -40,40 +150,49 @@ def read_opcua_node(node_id: str, ctx: Context) -> str:
     Returns:
         str: The value of the node as a string, prefixed with the node ID.
     """
-    client = ctx.request_context.lifespan_context["opcua_client"]
-    node = client.get_node(node_id)
-    value = node.get_value()  # Synchronous call to get node value
-    return f"Node {node_id} value: {value}"
+    try:
+        client = await get_opcua_client()
+        node = client.get_node(node_id)
+        value = node.get_value()
+        return f"Node {node_id} value: {value}"
+    except Exception as e:
+        return f"Error reading node {node_id}: {type(e).__name__}: {e}"
 
-# Tool: Write a value to an OPC UA node
+# Tool: Write a value to an OPC UA node - ENHANCED VERSION
 @mcp.tool()
-def write_opcua_node(node_id: str, value: str, ctx: Context) -> str:
+async def write_opcua_node(node_id: str, value: str, ctx: Context) -> str:
     """
-    Write a value to a specific OPC UA node.
+    Write a value to a specific OPC UA node with enhanced type detection.
     
     Parameters:
         node_id (str): The OPC UA node ID in the format 'ns=<namespace>;i=<identifier>'.
                        Example: 'ns=2;i=3'.
-        value (str): The value to write to the node. Will be converted based on node type.
+        value (str): The value to write to the node. Will be automatically converted to the correct data type.
     
     Returns:
         str: A message indicating success or failure of the write operation.
     """
-    client = ctx.request_context.lifespan_context["opcua_client"]
-    node = client.get_node(node_id)
     try:
-        # Convert value based on the node's current type
-        current_value = node.get_value()
-        if isinstance(current_value, (int, float)):
-            node.set_value(float(value))
-        else:
-            node.set_value(value)
-        return f"Successfully wrote {value} to node {node_id}"
+        client = await get_opcua_client()
+        node = client.get_node(node_id)
+        
+        # Use enhanced type detection and conversion
+        variant = await asyncio.to_thread(detect_and_convert_value, node, str(value))
+        data_value = ua.DataValue(variant)
+        
+        # Write the value using proper OPC UA data types
+        await asyncio.to_thread(node.set_data_value, data_value)
+        
+        # Verify the write
+        new_value = await asyncio.to_thread(node.get_value)
+        
+        return f"Successfully wrote {value} to node {node_id}. Verified value: {new_value}"
+        
     except Exception as e:
-        return f"Error writing to node {node_id}: {str(e)}"
+        return f"Error writing to node {node_id}: {type(e).__name__}: {e}"
 
 @mcp.tool()
-def browse_opcua_node_children(node_id: str, ctx: Context) -> str:
+async def browse_opcua_node_children(node_id: str, ctx: Context) -> str:
     """
     Browse the children of a specific OPC UA node.
 
@@ -84,8 +203,8 @@ def browse_opcua_node_children(node_id: str, ctx: Context) -> str:
         str: A string representation of a list of child nodes, including their NodeId and BrowseName.
              Returns an error message on failure.
     """
-    client = ctx.request_context.lifespan_context["opcua_client"]
     try:
+        client = await get_opcua_client()
         node = client.get_node(node_id)
         children = node.get_children()
         
@@ -103,15 +222,13 @@ def browse_opcua_node_children(node_id: str, ctx: Context) -> str:
                      "browse_name": f"Error getting name: {e}"
                  })
 
-        # import json
-        # return json.dumps(children_info, indent=2) 
         return f"Children of {node_id}: {children_info!r}" 
         
     except Exception as e:
-        return f"Error Browse children of node {node_id}: {str(e)}"
+        return f"Error browsing children of node {node_id}: {type(e).__name__}: {e}"
 
 @mcp.tool()
-def read_multiple_opcua_nodes(node_ids: List[str], ctx: Context) -> str:
+async def read_multiple_opcua_nodes(node_ids: List[str], ctx: Context) -> str:
     """
     Read the values of multiple OPC UA nodes in a single request.
 
@@ -121,19 +238,17 @@ def read_multiple_opcua_nodes(node_ids: List[str], ctx: Context) -> str:
     Returns:
         str: A string representation of a dictionary mapping node IDs to their values, or an error message.
     """
-    client = ctx.request_context.lifespan_context["opcua_client"]
     try:
+        client = await get_opcua_client()
         nodes_to_read = [client.get_node(nid) for nid in node_ids]
         values = []
+        
         # Iterate over each node in nodes_to_read
         for node in nodes_to_read:
             try:
-                # Get the value of the current node
                 value = node.get_value()
-                # Append the value to the values list
                 values.append(value)
             except Exception as e:
-                # In case of an error, append the error message
                 values.append(f"Error reading node {node.nodeid.to_string()}: {str(e)}")
         
         # Map node IDs to their corresponding values
@@ -141,22 +256,17 @@ def read_multiple_opcua_nodes(node_ids: List[str], ctx: Context) -> str:
         
         return f"Read multiple nodes values: {results!r}"
         
-    except ua.UaError as e:
-         status_name = e.code_as_name() if hasattr(e, 'code_as_name') else 'Unknown'
-         status_code_hex = f"0x{e.code:08X}" if hasattr(e, 'code') else 'N/A'
-         return f"Error reading multiple nodes {node_ids}: OPC UA Error - Status: {status_name} ({status_code_hex})"
     except Exception as e:
-        return f"Error reading multiple nodes {node_ids}: {type(e).__name__} - {str(e)}"
+        return f"Error reading multiple nodes {node_ids}: {type(e).__name__}: {e}"
     
 @mcp.tool()
-def write_multiple_opcua_nodes(nodes_to_write: List[Dict[str, Any]], ctx: Context) -> str:
+async def write_multiple_opcua_nodes(nodes_to_write: List[Dict[str, Any]], ctx: Context) -> str:
     """
-    Write values to multiple OPC UA nodes in a single request.
+    Write values to multiple OPC UA nodes in a single request with enhanced type detection.
 
     Parameters:
         nodes_to_write (List[Dict[str, Any]]): A list of dictionaries, where each dictionary 
                                                contains 'node_id' (str) and 'value' (Any).
-                                               The value will be wrapped in an OPC UA Variant.
                                                Example: [{'node_id': 'ns=2;i=2', 'value': 10.5}, 
                                                          {'node_id': 'ns=2;i=3', 'value': 'active'}]
 
@@ -164,44 +274,65 @@ def write_multiple_opcua_nodes(nodes_to_write: List[Dict[str, Any]], ctx: Contex
         str: A message indicating the success or failure of the write operation. 
              Returns status codes for each write attempt.
     """
-    client = ctx.request_context.lifespan_context["opcua_client"]
-    
-    node_ids_for_error_msg = [item.get('node_id', 'unknown_node') for item in nodes_to_write]
-
     try:
-        nodes = [client.get_node(item['node_id']) for item in nodes_to_write]
+        client = await get_opcua_client()
         
         # Iterate over nodes and values to set each value individually
         status_report = []
-        for node, item in zip(nodes, nodes_to_write):
+        for item in nodes_to_write:
             try:
-                # Create a Variant from the value
-                value_as_variant = ua.Variant(item['value'])
-                # Set the value of the node
-                current_value = node.get_value()
-                if isinstance(current_value, (int, float)):
-                    node.set_value(float(value_as_variant.Value))
-                else:
-                    node.set_value(value_as_variant.Value)
+                node = client.get_node(item['node_id'])
+                
+                # Use enhanced type detection and conversion
+                variant = await asyncio.to_thread(detect_and_convert_value, node, str(item['value']))
+                data_value = ua.DataValue(variant)
+                
+                # Write the value using proper OPC UA data types
+                await asyncio.to_thread(node.set_data_value, data_value)
+                
+                # Verify the write
+                new_value = await asyncio.to_thread(node.get_value)
 
                 status_report.append({
                     "node_id": item['node_id'],
                     "value_written": item['value'],
+                    "verified_value": new_value,
                     "status": "Success"
                 })
             except Exception as e:
-                return f"Error writing to node {node}: {str(e)}"
-        # Return the status report
+                status_report.append({
+                    "node_id": item['node_id'],
+                    "value_written": item['value'],
+                    "status": f"Error: {e}"
+                })
+        
         return f"Write multiple nodes results: {status_report!r}"
         
-    except ua.UaError as e: 
-         status_name = e.code_as_name() if hasattr(e, 'code_as_name') else 'Unknown'
-         status_code_hex = f"0x{e.code:08X}" if hasattr(e, 'code') else 'N/A'
-         return f"Error writing multiple nodes {node_ids_for_error_msg}: OPC UA Error - Status: {status_name} ({status_code_hex})"
     except Exception as e:
-        return f"Error writing multiple nodes {node_ids_for_error_msg}: {type(e).__name__} - {str(e)}"
+        return f"Error writing multiple nodes: {type(e).__name__}: {e}"
 
+# Tool: Test connection
+@mcp.tool()
+async def test_opcua_connection(ctx: Context) -> str:
+    """
+    Test the OPC UA connection and return basic server information.
     
+    Returns:
+        str: Connection status and basic server info.
+    """
+    try:
+        client = await get_opcua_client()
+        
+        # Get server info
+        root = client.get_root_node()
+        objects = client.get_objects_node()
+        children = objects.get_children()
+        
+        return f"Connected successfully to {server_url}. Found {len(children)} objects in root folder."
+        
+    except Exception as e:
+        return f"Connection test failed: {type(e).__name__}: {e}"
+
 # Run the server
 if __name__ == "__main__":
     mcp.run()
