@@ -64,18 +64,20 @@ pip install mcp[cli] opcua cryptography
 ```
 
 ### MCP Client Configuration
-
+I have added the path to the python evnironment
 ```json
 {
- "mcpServers": {
-   "opcua-mcp": {
-     "command": "python",
-     "args": ["path/to/opcua_mcp/main.py"],
-     "env": {
-        "OPCUA_SERVER_URL": "your-opc-ua-server-url"
-     }
-   }
- }
+  "mcpServers": {
+    "opcua-mcp": {
+      "command": "C:\\Users\\Owner\\anaconda3\\envs\\mcpopcua\python.exe",
+      "args": ["path to main.py"],
+      "env": {
+        "OPCUA_SERVER_URL": "opcua url",
+        "OPCUA_USERNAME": "your-username",
+        "OPCUA_PASSWORD": "your-password"
+      }
+    }
+  }
 }
 ```
 
